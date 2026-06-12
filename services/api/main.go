@@ -4,11 +4,11 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
-	"embed"
+	// "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/fs"
+	// "io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -21,21 +21,18 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-var staticFiles embed.FS
-
 
 type AppState struct {
 	DB            *sql.DB
 	WebhookSecret string
 }
 
-
 type Form struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Domain      string    `json:"domain"`
-	AmountSats  int64     `json:"amount_sats"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Domain     string    `json:"domain"`
+	AmountSats int64     `json:"amount_sats"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 type Message struct {
@@ -49,7 +46,6 @@ type Message struct {
 	CreatedAt   time.Time  `json:"created_at"`
 	PaidAt      *time.Time `json:"paid_at"`
 }
-
 
 type CreateFormRequest struct {
 	Name       string `json:"name"`
@@ -93,7 +89,6 @@ type LightningWebhook struct {
 	Status      string  `json:"status"`
 }
 
-
 func main() {
 	dbURL := getenv("DATABASE_URL", "satgate.db")
 	webhookSecret := getenv("LIGHTNING_WEBHOOK_SECRET", "satgate-dev-secret")
@@ -135,25 +130,24 @@ func main() {
 
 	r.POST("/api/webhooks/lightning", state.lightningWebhook)
 
-	sub, err := fs.Sub(staticFiles, "dist")
-	if err != nil {
-		log.Fatalf("failed to open embedded dist: %v", err)
-	}
-	fileServer := http.FileServer(http.FS(sub))
-	r.NoRoute(func(c *gin.Context) {
-		path := c.Request.URL.Path
-		if _, err := fs.Stat(sub, strings.TrimPrefix(path, "/")); err != nil {
-			c.Request.URL.Path = "/"
-		}
-		fileServer.ServeHTTP(c.Writer, c.Request)
-	})
+	// sub, err := fs.Sub(staticFiles, "dist")
+	// if err != nil {
+	// 	log.Fatalf("failed to open embedded dist: %v", err)
+	// }
+	// fileServer := http.FileServer(http.FS(sub))
+	// r.NoRoute(func(c *gin.Context) {
+	// 	path := c.Request.URL.Path
+	// 	if _, err := fs.Stat(sub, strings.TrimPrefix(path, "/")); err != nil {
+	// 		c.Request.URL.Path = "/"
+	// 	}
+	// 	fileServer.ServeHTTP(c.Writer, c.Request)
+	// })
 
 	log.Printf("SatGate API listening on :%s", port)
 	if err := r.Run(":" + port); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
-
 
 func (s *AppState) listForms(c *gin.Context) {
 	rows, err := s.DB.Query(
@@ -496,7 +490,6 @@ func (s *AppState) lightningWebhook(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-
 func (s *AppState) findForm(id string) (*Form, error) {
 	var f Form
 	err := s.DB.QueryRow(
@@ -599,7 +592,6 @@ func getenv(key, fallback string) string {
 	}
 	return fallback
 }
-
 
 func runMigrations(db *sql.DB) error {
 	_, err := db.Exec(`
