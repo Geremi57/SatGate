@@ -25,6 +25,10 @@ export function WidgetForm({ formId }: WidgetFormProps) {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+
+      console.log("FORM ID:", formId);
+
+    console.log("submit fired")
     setError("");
     setStatus("creating");
 
@@ -36,7 +40,10 @@ export function WidgetForm({ formId }: WidgetFormProps) {
         body,
       });
       setInvoice(nextInvoice);
+      console.log("INVOICE FROM BACKEND:", nextInvoice);
+console.log("PAYMENT REQUEST:", nextInvoice.payment_request);
       setStatus("pending");
+
 
       const nextQr = await QRCode.toDataURL(nextInvoice.payment_request, {
         margin: 1,
@@ -135,6 +142,7 @@ export function WidgetForm({ formId }: WidgetFormProps) {
             </p>
             <PrimaryButton className="mt-4" onClick={() => {
               setInvoice(null);
+              
               setQrDataUrl("");
               setStatus("idle");
             }}>
