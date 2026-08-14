@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
+
 	// "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+
 	// "io/fs"
 	"log"
 	"net/http"
@@ -22,9 +25,12 @@ import (
 )
 
 
+
 type AppState struct {
-	DB            *sql.DB
-	WebhookSecret string
+    DB            *sql.DB
+    WebhookSecret string
+    BlinkApiKey   string
+    BlinkWalletID string
 }
 
 type Form struct {
@@ -89,6 +95,11 @@ type LightningWebhook struct {
 	Status      string  `json:"status"`
 }
 
+type blinkInvoiceResult struct {
+    PaymentRequest string
+    PaymentHash    string
+}
+
 func main() {
 	dbURL := getenv("DATABASE_URL", "satgate.db")
 	webhookSecret := getenv("LIGHTNING_WEBHOOK_SECRET", "satgate-dev-secret")
@@ -107,9 +118,18 @@ func main() {
 	if err := seedDefaultForm(db); err != nil {
 		log.Fatalf("seed failed: %v", err)
 	}
+state := &AppState{
+    DB:            db,
+    WebhookSecret: webhookSecret,
+    BlinkApiKey:   getenv("BLINK_API_KEY", ""),
+    BlinkWalletID: getenv("BLINK_WALLET_ID", ""),
+}
 
-	state := &AppState{DB: db, WebhookSecret: webhookSecret}
-
+log.Printf(
+    "Blink configured: api_key=%t wallet_id=%t",
+    state.BlinkApiKey != "",
+    state.BlinkWalletID != "",
+)
 	r := gin.Default()
 	r.Use(cors.Default())
 
@@ -326,72 +346,241 @@ func (s *AppState) listMessages(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, messages)
 }
-
 func (s *AppState) createInvoice(c *gin.Context) {
+   log.Printf(
+        "CREATE INVOICE: BlinkApiKey=%t BlinkWalletID=%t",
+        s.BlinkApiKey != "",
+        s.BlinkWalletID != "",
+    )
+	
 	var req CreateInvoiceRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if err := validateMessagePayload(req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
 
-	form, err := s.findForm(req.FormID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "form not found"})
-		return
-	}
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
 
-	messageID := uuid.New().String()
-	invoiceID := uuid.New().String()
-	paymentHash := uuid.New().String()
-	now := time.Now().UTC()
-	expiresAt := now.Add(10 * time.Minute)
-	paymentRequest := buildDemoInvoice(invoiceID, form.AmountSats)
+	    log.Printf("CREATE INVOICE: form_id=%q", req.FormID)
 
-	tx, err := s.DB.Begin()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	defer tx.Rollback()
 
-	_, err = tx.Exec(`
-		INSERT INTO messages (id, form_id, sender_name, sender_email, body, status, payment_hash, created_at, paid_at)
-		VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, NULL)`,
-		messageID, req.FormID,
-		strings.TrimSpace(req.SenderName),
-		strings.TrimSpace(req.SenderEmail),
-		strings.TrimSpace(req.Body),
-		paymentHash, now,
-	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+    if err := validateMessagePayload(req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
 
-	_, err = tx.Exec(`
-		INSERT INTO invoices (id, message_id, amount_sats, payment_request, payment_hash, status, preimage, created_at, paid_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, ?)`,
-		invoiceID, messageID, form.AmountSats, paymentRequest, paymentHash, now, expiresAt,
-	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+    form, err := s.findForm(req.FormID)
+    if err != nil {
+        c.JSON(http.StatusNotFound, gin.H{"error": "form not found"})
+        return
+    }
 
-	tx.Commit()
+    messageID := uuid.New().String()
+    now := time.Now().UTC()
 
-	c.JSON(http.StatusOK, InvoiceResponse{
-		InvoiceID:      invoiceID,
-		MessageID:      messageID,
-		PaymentRequest: paymentRequest,
-		AmountSats:     form.AmountSats,
-		Status:         "pending",
-		ExpiresAt:      expiresAt,
-	})
+    memo := fmt.Sprintf(
+        "SatGate message from %s",
+        strings.TrimSpace(req.SenderName),
+    )
+
+println(s.BlinkWalletID)
+
+    blink, err := createBlinkInvoice(
+        s.BlinkApiKey,
+        s.BlinkWalletID,
+        form.AmountSats,
+        memo,
+    )
+    if err != nil {
+        log.Printf("Blink invoice creation failed: %v", err)
+
+        c.JSON(http.StatusInternalServerError, gin.H{
+            "error": err.Error(),
+        })
+        return
+    }
+
+    invoiceID := blink.PaymentHash
+    paymentRequest := blink.PaymentRequest
+    paymentHash := blink.PaymentHash
+    expiresAt := now.Add(24 * time.Hour)
+
+    tx, err := s.DB.Begin()
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer tx.Rollback()
+
+    _, err = tx.Exec(`
+        INSERT INTO messages (
+            id,
+            form_id,
+            sender_name,
+            sender_email,
+            body,
+            status,
+            payment_hash,
+            created_at,
+            paid_at
+        )
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, NULL)
+    `,
+        messageID,
+        req.FormID,
+        strings.TrimSpace(req.SenderName),
+        strings.TrimSpace(req.SenderEmail),
+        strings.TrimSpace(req.Body),
+        paymentHash,
+        now,
+    )
+
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+
+    _, err = tx.Exec(`
+        INSERT INTO invoices (
+            id,
+            message_id,
+            amount_sats,
+            payment_request,
+            payment_hash,
+            status,
+            preimage,
+            created_at,
+            paid_at,
+            expires_at
+        )
+        VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, ?)
+    `,
+        invoiceID,
+        messageID,
+        form.AmountSats,
+        paymentRequest,
+        paymentHash,
+        now,
+        expiresAt,
+    )
+
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+
+    if err := tx.Commit(); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+
+    log.Printf(
+        "Blink invoice created: invoice_id=%s amount=%d payment_hash=%s",
+        invoiceID,
+        form.AmountSats,
+        paymentHash,
+    )
+
+    c.JSON(http.StatusOK, InvoiceResponse{
+        InvoiceID:      invoiceID,
+        MessageID:      messageID,
+        PaymentRequest: paymentRequest,
+        AmountSats:     form.AmountSats,
+        Status:         "pending",
+        ExpiresAt:      expiresAt,
+    })
+}
+func createBlinkInvoice(
+    apiKey string,
+    walletID string,
+    amountSats int64,
+    memo string,
+) (*blinkInvoiceResult, error) {
+
+    payload := map[string]any{
+        "query": `
+            mutation LnInvoiceCreate($input: LnInvoiceCreateInput!) {
+                lnInvoiceCreate(input: $input) {
+                    invoice {
+                        paymentRequest
+                        paymentHash
+                    }
+                    errors {
+                        message
+                    }
+                }
+            }
+        `,
+        "variables": map[string]any{
+            "input": map[string]any{
+                "walletId": walletID,
+                "amount":   amountSats,
+                "memo":     memo,
+            },
+        },
+    }
+
+    body, err := json.Marshal(payload)
+    if err != nil {
+        return nil, err
+    }
+
+    req, err := http.NewRequest(
+        http.MethodPost,
+        "https://api.blink.sv/graphql",
+        bytes.NewReader(body),
+    )
+    if err != nil {
+        return nil, err
+    }
+
+    req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("X-API-KEY", apiKey)
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+        return nil, fmt.Errorf("blink returned HTTP %s", resp.Status)
+    }
+
+    var result struct {
+        Data struct {
+            LnInvoiceCreate struct {
+                Invoice struct {
+                    PaymentRequest string `json:"paymentRequest"`
+                    PaymentHash    string `json:"paymentHash"`
+                } `json:"invoice"`
+                Errors []struct {
+                    Message string `json:"message"`
+                } `json:"errors"`
+            } `json:"lnInvoiceCreate"`
+        } `json:"data"`
+    }
+
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return nil, err
+    }
+
+    invoice := result.Data.LnInvoiceCreate.Invoice
+
+    if len(result.Data.LnInvoiceCreate.Errors) > 0 {
+        return nil, fmt.Errorf(
+            "blink error: %s",
+            result.Data.LnInvoiceCreate.Errors[0].Message,
+        )
+    }
+
+    if invoice.PaymentRequest == "" {
+        return nil, fmt.Errorf("blink returned empty invoice")
+    }
+
+    return &blinkInvoiceResult{
+        PaymentRequest: invoice.PaymentRequest,
+        PaymentHash:    invoice.PaymentHash,
+    }, nil
 }
 
 func (s *AppState) getInvoice(c *gin.Context) {
@@ -491,13 +680,26 @@ func (s *AppState) lightningWebhook(c *gin.Context) {
 }
 
 func (s *AppState) findForm(id string) (*Form, error) {
+	    log.Printf("FIND FORM: looking for id=%q", id)
+
 	var f Form
 	err := s.DB.QueryRow(
 		"SELECT id, name, domain, amount_sats, created_at FROM forms WHERE id = ?", id,
 	).Scan(&f.ID, &f.Name, &f.Domain, &f.AmountSats, &f.CreatedAt)
 	if err != nil {
+		        log.Printf("FIND FORM: query failed: %v", err)
+
 		return nil, err
 	}
+
+	    log.Printf("FIND FORM: found %+v", f)
+
+		 log.Printf("FIND FORM: found id=%q name=%q amount=%d",
+        f.ID,
+        f.Name,
+        f.AmountSats,
+    )
+
 	return &f, nil
 }
 
